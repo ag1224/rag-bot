@@ -15,7 +15,7 @@ Python-based Retrieval-Augmented Generation chatbot using ChromaDB for vector hy
 
 1. **Install dependencies:**
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 2. **Configure API key:**
@@ -25,29 +25,29 @@ echo "OPENAI_API_KEY=your_key_here" > .env
 
 3. **Run the chatbot:**
 ```bash
-python main.py
+uv run main.py
 ```
 
 ## Usage
 
 ### Interactive Chat
 ```bash
-python main.py
+uv run main.py
 ```
 
 ### Single Query
 ```bash
-python main.py --query "How do I train a BERT model?"
+uv run main.py --query "How do I train a BERT model?"
 ```
 
 ### Rebuild Index
 ```bash
-python main.py --rebuild
+uv run main.py --rebuild
 ```
 
 ### REST API
 ```bash
-python api.py
+uv run api.py
 ```
 
 **Endpoints:**

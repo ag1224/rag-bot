@@ -57,8 +57,19 @@ def prepare_data() -> list:
     """Load and prepare data for indexing."""
     documents = load_youtube_data()
     nodes = chunk_documents(documents)
-    print(f"First node: {nodes[0]}")
+    print_node_details(nodes[0])
     return nodes
+
+
+def print_node_details(node) -> None:
+    """Print relevant properties of a node."""
+    print("--- Node Details ---")
+    print(f"Node ID: {node.node_id}")
+    print(f"Text (preview): {node.get_content()[:200]}")
+    print(f"Metadata: {node.metadata}")
+    print(f"Relationships: {node.relationships}")
+    print(f"Start char idx: {node.start_char_idx}")
+    print(f"End char idx: {node.end_char_idx}")
 
 
 if __name__ == "__main__":

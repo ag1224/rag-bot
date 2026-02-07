@@ -1,0 +1,15 @@
+# RAG Pipeline Dependencies
+llama-index
+llama-index-vector-stores-chroma
+llama-index-embeddings-openai
+llama-index-llms-openai
+llama-index-retrievers-bm25
+chromadb
+openai
+pandas
+python-dotenv
+tqdm
+llama-index-retrievers-bm25
+fastapi
+uvicorn
+pydantic

@@ -4,8 +4,8 @@ import os
 from typing import Optional
 
 from llama_index.core import VectorStoreIndex, StorageContext, Settings
-from llama_index.core.retrievers import BaseRetriever
-from llama_index.core.schema import NodeWithScore, QueryBundle
+from llama_index.core.retrievers import BaseRetriever, QueryFusionRetriever
+from llama_index.core.schema import NodeWithScore
 from llama_index.core.prompts import PromptTemplate
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -37,51 +37,23 @@ class HybridRetriever(BaseRetriever):
             nodes=nodes,
             similarity_top_k=top_k * 2,
         )
-        self.node_map = {node.node_id: node for node in nodes}
+        # self.node_map = {node.node_id: node for node in nodes}
+        self.fusion_retriever = QueryFusionRetriever(
+            retrievers=[self.vector_retriever, self.bm25_retriever],
+            similarity_top_k=top_k,
+            retriever_weights=[
+                self.alpha,
+                1 - self.alpha,
+            ],  # weight for vector and bm25 retrievers
+            num_queries=1,  # set this to 1 to disable query generation
+            mode="relative_score",  # use relative score to combine scores
+            use_async=True,
+            verbose=True,
+        )
 
-    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
+    def _retrieve(self, query: str) -> list[NodeWithScore]:
         """Retrieve using hybrid search (dense + sparse)."""
-        query = query_bundle.query_str
-
-        # Dense retrieval (vector search)
-        dense_results = self.vector_retriever.retrieve(query)
-        dense_scores = {r.node.node_id: r.score for r in dense_results}
-        print(
-            f"Dense scores length: {len(dense_scores)}, 1st dense score: {list(dense_scores.items())[0]}"
-        )
-
-        # Sparse retrieval (BM25)
-        bm25_results = self.bm25_retriever.retrieve(query)
-        sparse_scores = {r.node.node_id: r.score for r in bm25_results}
-        print(
-            f"Sparse scores length: {len(sparse_scores)}, 1st sparse score: {list(sparse_scores.items())[0]}"
-        )
-
-        # Combine scores: alpha * dense + (1 - alpha) * sparse
-        all_node_ids = set(dense_scores.keys()) | set(sparse_scores.keys())
-        combined_scores = {}
-        print(f"Length of all node ids: {len(all_node_ids)}")
-
-        for node_id in all_node_ids:
-            dense_score = dense_scores.get(node_id, 0)
-            sparse_score = sparse_scores.get(node_id, 0)
-            combined_scores[node_id] = (
-                self.alpha * dense_score + (1 - self.alpha) * sparse_score
-            )
-
-        # Sort and get top-k
-        sorted_nodes = sorted(
-            combined_scores.items(), key=lambda x: x[1], reverse=True
-        )[: self.top_k]
-
-        # Build results
-        results = []
-        for node_id, score in sorted_nodes:
-            if node_id in self.node_map:
-                node = self.node_map[node_id]
-                results.append(NodeWithScore(node=node, score=score))
-        print(f"Results length: {len(results)}, 1st result: {results[0]}")
-        return results
+        return self.fusion_retriever.retrieve(query)
 
 
 class RAGPipeline:
@@ -180,7 +152,9 @@ class RAGPipeline:
         """Get the QA prompt template with context."""
         template = """You are a helpful AI assistant specializing in explaining technical concepts from YouTube video transcripts. 
 
-                Use the following context from video transcripts to answer the question. Include relevant video titles and timestamps when helpful.
+                Use the following context from video transcripts to answer the question.
+                Respond in Markdown.
+                Include source citations in the answer body like [Source 1], [Source 2] when relevant.
 
                 If the answer is not in the context, say so clearly. Do not make up information.
 
@@ -192,38 +166,97 @@ class RAGPipeline:
                 Answer: """
         return PromptTemplate(template)
 
-    def _format_context(self, nodes: list[NodeWithScore]) -> str:
-        """Format retrieved nodes into context string."""
+    def _is_query_in_domain(self, question: str) -> bool:
+        """Check whether the query is in scope for this transcript corpus."""
+        if not config.ENABLE_DOMAIN_GUARD:
+            return True
+
+        guard_prompt = f"""You are a strict classifier.
+                        Task: Decide if the user question is in-domain for a YouTube technical transcript QA system.
+                        In-domain includes: AI, ML, LLMs, transformers, NLP, Python coding, model training, embeddings, vector databases, RAG, APIs, and software engineering topics likely discussed in technical videos.
+                        Out-of-domain includes: medicine, law, finance advice, personal life, general trivia unrelated to technical video transcript content.
+
+                        Return ONLY one token: YES or NO.
+
+                        Question: {question}
+                        Label:"""
+        label = str(Settings.llm.complete(guard_prompt)).strip().upper()
+        return label.startswith("YES")
+
+    # def _has_sufficient_evidence(self, nodes: list[NodeWithScore]) -> bool:
+    #     """Check if retrieved evidence is strong enough to answer confidently."""
+    #     if not config.ENABLE_EVIDENCE_GUARD:
+    #         return True
+    #     if not nodes:
+    #         return False
+
+    #     scores = [float(n.score) for n in nodes if n.score is not None]
+    #     if not scores:
+    #         return False
+
+    #     top_score = max(scores)
+    #     avg_score = sum(scores) / len(scores)
+    #     return top_score >= config.MIN_TOP_SCORE and avg_score >= config.MIN_AVG_SCORE
+
+    def _guardrail_response(self, message: str) -> dict:
+        """Consistent markdown response when guardrails block answering."""
+        return {
+            "answer": f"{message}\n\n## Sources\n- No sources used.",
+            "sources": [],
+        }
+
+    def _build_context_and_sources(self, nodes: list[NodeWithScore]) -> tuple[str, str]:
+        """Build LLM context and markdown source links in one pass."""
+        if not nodes:
+            return "", ""
+
         context_parts = []
+        source_lines = ["## Sources"]
+
         for i, node in enumerate(nodes, 1):
             metadata = node.node.metadata
             title = metadata.get("title", "Unknown")
-            url = metadata.get("url", "")
-            start = metadata.get("start_time", 0)
-
-            minutes = int(start // 60)
-            seconds = int(start % 60)
+            base_url = metadata.get("url", "")
+            start = int(metadata.get("start_time", 0))
+            minutes = start // 60
+            seconds = start % 60
             timestamp = f"{minutes}:{seconds:02d}"
+            source_url = f"{base_url}&t={start}s" if base_url else ""
 
             context_parts.append(
                 f'[Source {i}] Video: "{title}" (at {timestamp})\n'
-                f"URL: {url}&t={int(start)}s\n"
+                f"URL: {source_url}\n"
                 f"Content: {node.node.get_content()}\n"
             )
 
-        return "\n---\n".join(context_parts)
+            if source_url:
+                source_lines.append(
+                    f"- **[Source {i}]** [{title} ({timestamp})]({source_url})"
+                )
+            else:
+                source_lines.append(f"- **[Source {i}]** {title} ({timestamp})")
+
+        return "\n---\n".join(context_parts), "\n".join(source_lines)
 
     def query(self, question: str) -> dict:
         """Query the RAG pipeline."""
+        if not self._is_query_in_domain(question):
+            return self._guardrail_response(
+                "I can only answer questions related to the technical YouTube transcripts in the dataset. "
+            )
+
         retrieved_nodes = self.hybrid_retriever.retrieve(question)
-        context = self._format_context(retrieved_nodes)
+        context, sources_markdown = self._build_context_and_sources(retrieved_nodes)
 
         prompt = self._get_qa_prompt()
         formatted_prompt = prompt.format(context=context, query=question)
         response = Settings.llm.complete(formatted_prompt)
+        answer_markdown = str(response).strip()
+        if sources_markdown:
+            answer_markdown = f"{answer_markdown}\n\n{sources_markdown}"
 
         return {
-            "answer": str(response),
+            "answer": answer_markdown,
             "sources": [
                 {
                     "title": n.node.metadata.get("title", ""),

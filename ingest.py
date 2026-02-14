@@ -2,18 +2,26 @@
 
 import pandas as pd
 from tqdm import tqdm
-from llama_index.core import Document
-from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.schema import TextNode
 import config
 
 
-def load_youtube_data(file_path: str = config.DATA_PATH) -> list[Document]:
-    """Load YouTube transcript data from CSV and convert to LlamaIndex Documents."""
+def load_youtube_data(file_path: str = config.DATA_PATH) -> list[TextNode]:
+    """Load YouTube transcript data from CSV and convert to TextNodes.
+    
+    Note: YouTube transcripts are already segmented with accurate start/end times.
+    We skip chunking to preserve timestamp accuracy for each segment.
+    """
     df = pd.read_csv(file_path)
-    documents = []
+    nodes = []
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Loading documents"):
-        # Create metadata dict
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Loading transcripts"):
+        # Get text content
+        text = str(row.get("text", ""))
+        if not text or text == "nan":
+            continue
+        
+        # Create metadata dict with accurate timestamps
         metadata = {
             "id": str(row.get("id", "")),
             "title": str(row.get("title", "")),
@@ -24,40 +32,24 @@ def load_youtube_data(file_path: str = config.DATA_PATH) -> list[Document]:
             "end_time": float(row.get("end", 0)),
         }
 
-        # Get text content
-        text = str(row.get("text", ""))
-        if not text or text == "nan":
-            continue
-
-        # Create document with metadata
-        doc = Document(
+        # Create TextNode directly (no splitting needed - preserves timestamps)
+        node = TextNode(
             text=text,
             metadata=metadata,
             excluded_llm_metadata_keys=["id", "channel_id"],
             excluded_embed_metadata_keys=["id", "channel_id", "start_time", "end_time"],
         )
-        documents.append(doc)
+        nodes.append(node)
 
-    print(f"Loaded {len(documents)} documents")
-    return documents
-
-
-def chunk_documents(documents: list[Document]) -> list:
-    """Split documents into smaller chunks for better retrieval."""
-    splitter = SentenceSplitter(
-        chunk_size=config.CHUNK_SIZE,
-        chunk_overlap=config.CHUNK_OVERLAP,
-    )
-    nodes = splitter.get_nodes_from_documents(documents, show_progress=True)
-    print(f"Created {len(nodes)} chunks from {len(documents)} documents")
+    print(f"Loaded {len(nodes)} transcript segments")
     return nodes
 
 
-def prepare_data() -> list:
+def prepare_data() -> list[TextNode]:
     """Load and prepare data for indexing."""
-    documents = load_youtube_data()
-    nodes = chunk_documents(documents)
-    print_node_details(nodes[0])
+    nodes = load_youtube_data()
+    if nodes:
+        print_node_details(nodes[0])
     return nodes
 
 

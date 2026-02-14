@@ -1,6 +1,7 @@
 """FastAPI REST API for YouTube RAG Chatbot."""
 
 from contextlib import asynccontextmanager
+from time import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -8,6 +9,16 @@ import config
 from rag_pipeline import RAGPipeline
 
 pipeline: RAGPipeline = None
+
+# Simple in-memory cache for repeated queries.
+# key: (normalized_question, top_k), value: {"expires_at": ts, "result": dict}
+QUERY_CACHE: dict[tuple[str, int], dict] = {}
+CACHE_TTL_SECONDS = config.CACHE_TTL_SECONDS
+
+
+def _cache_key(question: str, top_k: int) -> tuple[str, int]:
+    normalized_question = " ".join(question.strip().lower().split())
+    return normalized_question, top_k
 
 
 @asynccontextmanager
@@ -75,16 +86,29 @@ async def query(request: QueryRequest):
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
 
     try:
+        # Fast path: return cached response for repeated queries.
+        key = _cache_key(request.question, request.top_k)
+        cached = QUERY_CACHE.get(key)
+        now_ts = time()
+        if cached and cached["expires_at"] > now_ts:
+            return QueryResponse(**cached["result"])
+
         if request.top_k != config.TOP_K:
             pipeline.hybrid_retriever.top_k = request.top_k
 
         result = pipeline.query(request.question)
+        response_payload = {
+            "answer": result["answer"],
+            "sources": [Source(**s) for s in result["sources"]],
+            "query": request.question,
+        }
 
-        return QueryResponse(
-            answer=result["answer"],
-            sources=[Source(**s) for s in result["sources"]],
-            query=request.question,
-        )
+        QUERY_CACHE[key] = {
+            "expires_at": now_ts + CACHE_TTL_SECONDS,
+            "result": response_payload,
+        }
+
+        return QueryResponse(**response_payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -97,6 +121,7 @@ async def rebuild_index():
     try:
         print("Rebuilding index...")
         pipeline = RAGPipeline(rebuild_index=True)
+        QUERY_CACHE.clear()
         return {"status": "success", "message": "Index rebuilt successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
